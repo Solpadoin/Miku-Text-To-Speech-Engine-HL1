@@ -76,8 +76,8 @@ Pillow>=10.0.0        # Windows only (tray icon)
 ### Step 1 — Clone the repository
 
 ```bash
-git clone https://github.com/yourusername/MikuTTS.git
-cd MikuTTS
+[git clone https://github.com/yourusername/MikuTTS.git](https://github.com/Solpadoin/Miku-Text-To-Speech-Engine-HL1.git)
+cd Miku-Text-To-Speech-Engine-HL1
 ```
 
 ### Step 2 — Install Python dependencies

@@ -55,6 +55,7 @@ CHAT_MAX_LEN   = cfg.getint("game", "chat_max_len", fallback=200)
 
 COOLDOWN_EXTRA = cfg.getfloat("audio", "cooldown_extra", fallback=2.0)
 SAMPLE_RATE    = cfg.getint("audio", "sample_rate", fallback=48000)
+VOLUME         = min(100, max(70, cfg.getint("audio", "volume", fallback=100))) / 100.0
 
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR      = os.path.join(BASE_DIR, cfg.get("cache", "cache_dir", fallback="cache"))
@@ -109,6 +110,17 @@ def is_on_cooldown(text):
 def set_cooldown(text, duration):
     with cooldown_lock:
         cooldown_map[text.lower()] = time.time() + duration + COOLDOWN_EXTRA
+
+def set_cooldown_immediate(text):
+    # Set a temporary cooldown immediately to block log duplicates
+    # while audio is being fetched/played
+    with cooldown_lock:
+        cooldown_map[text.lower()] = time.time() + 60.0  # placeholder 60s
+
+def update_cooldown(text, actual_duration):
+    # Update with real duration after playback
+    with cooldown_lock:
+        cooldown_map[text.lower()] = time.time() + actual_duration + COOLDOWN_EXTRA
 
 # --- Cache ---
 def load_cache():
@@ -165,6 +177,8 @@ def prepare_audio(mp3_path):
     if sr != SAMPLE_RATE:
         data = soxr.resample(data, sr, SAMPLE_RATE, quality='MQ')
         sr = SAMPLE_RATE
+    # Apply volume (clamped to 70-100%)
+    data = data * VOLUME
     data = (data * 32767).astype(np.int16)
     return data, sr
 
@@ -235,7 +249,7 @@ def send_key(key, down=True):
 def play_to_virtual_mic(mp3_path, cable_idx, local_idx):
     data, sr = prepare_audio(mp3_path)
     duration = len(data) / sr
-    log("AUDIO", f"Duration: {duration:.2f}s, {sr}Hz", C.YELLOW)
+    log("AUDIO", f"Duration: {duration:.2f}s, {sr}Hz, volume: {int(VOLUME*100)}%", C.YELLOW)
 
     send_key(PTT_KEY, down=True)
     time.sleep(0.3)
@@ -269,37 +283,47 @@ def speak(text, cable_idx, local_idx, cache, source="LOG"):
         return
     if is_on_cooldown(text):
         return
+
+    # Set immediate cooldown to block log duplicates BEFORE async work
+    set_cooldown_immediate(text)
+
     log("TRIGGER", f"[{source}] Triggered: \"{text}\"", C.PINK)
     update_status(f"Speaking: {text[:40]}...")
     try:
         mp3_path = get_audio(text, cache)
         duration = play_to_virtual_mic(mp3_path, cable_idx, local_idx)
-        set_cooldown(text, duration)
+        # Update with real duration
+        update_cooldown(text, duration)
         update_status("Listening to chat...")
     except Exception as e:
         log("ERR", f"Error: {e}", C.RED)
         update_status(f"Error: {e}")
+        # Release cooldown on error
+        with cooldown_lock:
+            cooldown_map.pop(text.lower(), None)
 
 # --- Keyboard hook ---
 def start_keyboard_hook(cable_idx, local_idx, cache):
-    """
-    Intercepts chat key (default Y), captures typed text,
-    and triggers TTS immediately on Enter — before the log is written.
-    """
     state = {
         "active": False,
-        "buffer": ""
+        "buffer": "",
+        "shift": False,
     }
 
     def on_key(event):
+        # Track shift state separately — avoids keyboard.is_pressed() race condition
+        if event.name in ("shift", "left shift", "right shift"):
+            state["shift"] = (event.event_type == "down")
+            return
+
         if event.event_type != "down":
             return
 
-        # Chat key pressed — start capturing
+        # Chat key opens input
         if event.name == CHAT_KEY and not state["active"]:
             state["active"] = True
             state["buffer"] = ""
-            log("HOOK", f"Chat opened ({CHAT_KEY.upper()}), capturing input...", C.CYAN)
+            log("HOOK", f"Chat opened ({CHAT_KEY.upper()}), capturing...", C.CYAN)
             return
 
         if not state["active"]:
@@ -311,7 +335,6 @@ def start_keyboard_hook(cable_idx, local_idx, cache):
             state["buffer"] = ""
             log("HOOK", f"Chat submitted: \"{text}\"", C.CYAN)
 
-            # Check trigger and length
             pattern = re.compile(re.escape(TRIGGER) + r'\s+(.*)', re.IGNORECASE)
             m = pattern.search(text)
             if m and len(text) <= CHAT_MAX_LEN:
@@ -333,15 +356,15 @@ def start_keyboard_hook(cable_idx, local_idx, cache):
         elif event.name == "space":
             state["buffer"] += " "
 
+        elif event.name == "caps lock":
+            pass
+
         elif len(event.name) == 1:
-            # Regular character
-            if keyboard.is_pressed("shift"):
-                state["buffer"] += event.name.upper()
-            else:
-                state["buffer"] += event.name
+            char = event.name.upper() if state["shift"] else event.name
+            state["buffer"] += char
 
     keyboard.hook(on_key)
-    log("HOOK", f"Keyboard hook active — chat key: {CHAT_KEY.upper()}, max length: {CHAT_MAX_LEN}", C.GREEN)
+    log("HOOK", f"Keyboard hook active — chat key: {CHAT_KEY.upper()}, max: {CHAT_MAX_LEN} chars", C.GREEN)
 
 # --- Single instance ---
 def check_single_instance():
@@ -417,6 +440,7 @@ def startup_checks():
     local_idx = sd.default.device[1]
     devices = sd.query_devices()
     log("CHECK", f"Local output: [{local_idx}] {devices[local_idx]['name']} — OK", C.GREEN)
+    log("CHECK", f"Volume: {int(VOLUME*100)}%", C.GREEN)
 
     log("CHECK", "All checks passed!", C.GREEN)
     print(flush=True)
@@ -481,7 +505,7 @@ def monitor_loop(cable_idx, local_idx, cache):
                         text = m.group(1).strip()
                         if not text:
                             continue
-                        # If already spoken via keyboard hook — skip
+                        # Cooldown handles dedup with keyboard hook
                         speak(text, cable_idx, local_idx, cache, source="LOG")
 
         except Exception as e:
@@ -497,7 +521,6 @@ def on_quit(icon, item):
 def run_tray(cable_idx, local_idx, cache):
     thread = threading.Thread(target=monitor_loop, args=(cable_idx, local_idx, cache), daemon=True)
     thread.start()
-
     icon = pystray.Icon(
         "MikuTTS",
         create_icon(),
@@ -535,6 +558,7 @@ def main():
     log("SYS", f"Trigger: {TRIGGER}", C.CYAN)
     log("SYS", f"PTT key: {PTT_KEY.upper()}", C.CYAN)
     log("SYS", f"Chat key: {CHAT_KEY.upper()}", C.CYAN)
+    log("SYS", f"Volume: {int(VOLUME*100)}%", C.CYAN)
     log("SYS", f"Cooldown: +{COOLDOWN_EXTRA}s", C.CYAN)
 
     cache = load_cache()
@@ -542,7 +566,6 @@ def main():
 
     cable_idx, local_idx = startup_checks()
 
-    # Start keyboard hook for instant response
     start_keyboard_hook(cable_idx, local_idx, cache)
 
     log("SYS", "Starting monitor...", C.GREEN)

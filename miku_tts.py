@@ -46,6 +46,10 @@ MODEL          = cfg.get("elevenlabs", "model", fallback="eleven_multilingual_v2
 STABILITY      = cfg.getfloat("elevenlabs", "stability", fallback=0.5)
 SIMILARITY     = cfg.getfloat("elevenlabs", "similarity_boost", fallback=0.75)
 
+STYLE          = cfg.getfloat("elevenlabs", "style", fallback=0.95)
+SPEAKER_BOOST  = cfg.getboolean("elevenlabs", "speaker_boost", fallback=True)
+OUTPUT_FORMAT  = cfg.get("elevenlabs", "output_format", fallback="mp3_44100_128")
+
 LOG_FILE       = cfg.get("game", "log_file")
 HL_PROCESS     = cfg.get("game", "process_name", fallback="hl.exe")
 TRIGGER        = cfg.get("game", "trigger", fallback="!miku")
@@ -139,16 +143,46 @@ def save_cache(text, mp3_path):
 # --- TTS ---
 def elevenlabs_tts(text):
     log("API", f"Requesting TTS: \"{text}\"", C.CYAN)
+
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-    headers = {"xi-api-key": API_KEY, "Content-Type": "application/json"}
+
+    headers = {
+        "xi-api-key": API_KEY,
+        "Content-Type": "application/json"
+    }
+
     body = {
         "text": text,
         "model_id": MODEL,
-        "voice_settings": {"stability": STABILITY, "similarity_boost": SIMILARITY}
+
+        "voice_settings": {
+            "stability": STABILITY,
+            "similarity_boost": SIMILARITY,
+            "style": STYLE,
+            "use_speaker_boost": SPEAKER_BOOST
+        }
     }
-    r = requests.post(url, headers=headers, json=body)
+
+    params = {
+        "output_format": OUTPUT_FORMAT
+    }
+
+    r = requests.post(
+        url,
+        headers=headers,
+        json=body,
+        params=params,
+        timeout=60
+    )
+
     r.raise_for_status()
-    log("API", f"Response received — {len(r.content)} bytes", C.GREEN)
+
+    log(
+        "API",
+        f"Response received — {len(r.content)} bytes",
+        C.GREEN
+    )
+
     return r.content
 
 def get_audio(text, cache):
